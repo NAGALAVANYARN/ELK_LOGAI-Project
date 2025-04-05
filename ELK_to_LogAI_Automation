@@ -1,0 +1,329 @@
+pipeline {
+    agent any
+
+    environment {
+        LOGAI_VM = '192.168.1.45'
+        ELASTICSEARCH_VM = '192.168.1.50'
+        KIBANA_VM = '192.168.1.50'
+        ELASTICSEARCH_PORT = '9200'
+        KIBANA_PORT = '5601'
+        LOGAI_PORT = '8000'
+        TARGET_PATH = '/home/logai/PiltiSmartLogAI/gui/uploaded_files/'
+        SSH_KEY_PATH = '/var/jenkins_home/.ssh/id_rsa'
+        SSH_USER = 'logai'  // Define SSH user here
+        LOG_FILE_PATH = '/home/logai/PiltiSmartLogAI/gui/uploaded_files/custom_thingsboard1.log'  // Define the log file path here
+    }
+
+    stages {
+        stage('Check and Generate SSH Key') {
+            steps {
+                script {
+                    echo "Checking for SSH key at ${SSH_KEY_PATH}..."
+                    if (!fileExists(SSH_KEY_PATH)) {
+                        echo "SSH Private Key does not exist at ${SSH_KEY_PATH}. Creating a new one..."
+                        sh 'mkdir -p /var/jenkins_home/.ssh'
+                        sh 'ssh-keygen -t rsa -b 2048 -f /var/jenkins_home/.ssh/id_rsa -N ""'
+                        sh 'chmod 700 /var/jenkins_home/.ssh'
+                        sh 'chmod 600 /var/jenkins_home/.ssh/id_rsa'
+                        sh 'chmod 644 /var/jenkins_home/.ssh/id_rsa.pub'
+                        echo "SSH key generated successfully."
+                    } else {
+                        echo "SSH Private Key already exists at ${SSH_KEY_PATH}. Skipping key generation."
+                    }
+                }
+            }
+        }
+
+        stage('Install Netcat') {
+            steps {
+                script {
+                    echo "Checking if nc (Netcat) is installed..."
+                    def ncInstalled = sh(script: "which nc || echo 'not_installed'", returnStdout: true).trim()
+                    if (ncInstalled == 'not_installed') {
+                        echo "Netcat (nc) not found. Installing..."
+                        sh """
+                            if [ -f /etc/debian_version ]; then
+                                apt-get update && apt-get install -y netcat-openbsd
+                            elif [ -f /etc/redhat-release ]; then
+                                yum install -y nc
+                            fi
+                        """
+                    } else {
+                        echo "Netcat (nc) is already installed."
+                    }
+                }
+            }
+        }
+
+        stage('Check Elasticsearch Service') {
+            steps {
+                script {
+                    echo "Checking Elasticsearch service on ${ELASTICSEARCH_VM}:${ELASTICSEARCH_PORT}..."
+                    def elasticsearchStatus = sh(script: "nc -zv ${ELASTICSEARCH_VM} ${ELASTICSEARCH_PORT}", returnStatus: true)
+                    if (elasticsearchStatus != 0) {
+                        echo "VM - 115: Elasticsearch service is not running on the Proxmox ${ELASTICSEARCH_VM}:${ELASTICSEARCH_PORT}"
+                    } else {
+                        echo "Elasticsearch service is running on ${ELASTICSEARCH_VM}:${ELASTICSEARCH_PORT}"
+                    }
+                }
+            }
+        }
+
+        stage('Check Kibana Service') {
+            steps {
+                script {
+                    echo "Checking Kibana service on ${KIBANA_VM}:${KIBANA_PORT}..."
+                    def kibanaStatus = sh(script: "nc -zv ${KIBANA_VM} ${KIBANA_PORT}", returnStatus: true)
+                    if (kibanaStatus != 0) {
+                        echo "VM - 115: Kibana service is not running on the Proxmox ${KIBANA_VM}:${KIBANA_PORT}"
+                    } else {
+                        echo "Kibana service is running on ${KIBANA_VM}:${KIBANA_PORT}"
+                    }
+                }
+            }
+        }
+
+        stage('Check LogAI Service') {
+            steps {
+                script {
+                    echo "Checking LogAI service on ${LOGAI_VM}:${LOGAI_PORT}..."
+                    def logaiStatus = sh(script: "nc -zv ${LOGAI_VM} ${LOGAI_PORT}", returnStatus: true)
+                    if (logaiStatus != 0) {
+                        echo "VM - 114: LogAI is not running on the Proxmox: ${LOGAI_VM}:${LOGAI_PORT}"
+                    } else {
+                        echo "LogAI service is running on ${LOGAI_VM}:${LOGAI_PORT}"
+                    }
+                }
+            }
+        }
+
+        stage('Fetch Logs from Elasticsearch') {
+            steps {
+                script {
+                    try {
+                        echo "Fetching logs from Elasticsearch..."
+                        def esUrl = "http://192.168.1.50:9200/"
+                        def esIndex = "thingsboard-*"
+                        def queryBody = """{
+                            "size": 1000,
+                            "query": {
+                                "range": {
+                                    "@timestamp": {
+                                        "gte": "now-1h/m",
+                                        "lt": "now/m"
+                                    }
+                                }
+                            }
+                        }"""
+
+                        // Execute the Elasticsearch query via HTTP request
+                        echo "Executing Elasticsearch query..."
+                        def response = httpRequest(
+                            acceptType: 'APPLICATION_JSON',
+                            contentType: 'APPLICATION_JSON',
+                            httpMode: 'POST',
+                            url: esUrl + esIndex + "/_search",
+                            authentication: 'elasticsearch-auth',
+                            requestBody: queryBody
+                        )
+
+                        def responseJson = readJSON text: response.content
+                        logs = responseJson.hits.hits
+
+                        if (logs.isEmpty()) {
+                            echo "No logs found in the last 1 hour."
+                            currentBuild.result = 'SUCCESS'
+                            return
+                        } else {
+                            echo "Fetched ${logs.size()} logs from Elasticsearch."
+                            currentBuild.description = "Fetched logs: ${logs.size()}"
+                        }
+                    } catch (Exception e) {
+                        echo "Error fetching logs from Elasticsearch: ${e.message}"
+                        logs = []
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+
+        stage('Transform Logs') {
+            steps {
+                script {
+                    try {
+                        echo "Transforming logs..."
+                        def transformedLogs = []
+
+                        // Helper function to extract log level and message from log string
+                        def extractLogLevelAndMessage = { logMessage ->
+                            def logLevel = 'INFO'
+
+                            def matcher = (logMessage =~ /\b(ERROR|WARN|INFO|DEBUG|TRACE)\b/)
+                            if (matcher) {
+                                logLevel = matcher[0][0].toUpperCase()
+                                logMessage = logMessage.replaceAll(/\b(ERROR|WARN|INFO|DEBUG|TRACE)\b/, "").trim()  // Clean the log level from the message
+                            }
+                            return [logLevel, logMessage]
+                        }
+
+                        // Helper function to clean up the log message
+                        def cleanLogMessage = { logMessage ->
+                            // Remove contents inside square brackets, including the brackets
+                            logMessage = logMessage.replaceAll(/\[.*?\]/, "")
+                            // Remove any additional timestamps from inside the message
+                            logMessage = logMessage.replaceAll(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(:\d{3})?/, "")
+                            // Remove numbers with commas (e.g., ,053) from the message
+                            logMessage = logMessage.replaceAll(/,\d+/, "")
+                            // Clean up log levels (INFO, WARN, ERROR, etc.) from the message
+                            logMessage = logMessage.replaceAll(/(?i)\b(INFO|ERROR|WARN|DEBUG|TRACE)\b/, "").trim()
+                            return logMessage.trim()
+                        }
+
+                        logs.each { log ->
+                            def timestamp = log._source.'@timestamp'
+                            if (timestamp) {
+                                // Replacing 'T' with space
+                                timestamp = timestamp.replace('T', ' ').split("\\.")[0]
+
+                                // If there are microseconds or fractions of seconds, append them
+                                def microseconds = log._source.'@timestamp'?.substring(20, 23) ?: ''
+                                if (microseconds) {
+                                    timestamp = "${timestamp}:${microseconds}" // Add microseconds to the timestamp
+                                }
+                            }
+
+                            def message = log._source.event?.original ?: log._source.raw_data ?: log._source.message
+                            def hostName = log._source.host?.name ?: 'default_host'
+
+                            // Extract log level and clean the message
+                            def (logLevel, cleanedMessage) = extractLogLevelAndMessage(message)
+                            cleanedMessage = cleanLogMessage(cleanedMessage)
+
+                            // Formatting with fixed width for alignment
+                            def timestampFormatted = timestamp.padRight(23) // Ensure the timestamp is 23 characters wide
+                            def logLevelFormatted = logLevel.padRight(5)     // Ensure the log level is 5 characters wide
+                            def hostNameFormatted = hostName.padRight(12)     // Ensure host is 12 characters wide
+
+                            def finalLog = "${timestampFormatted} ${logLevelFormatted} ${hostNameFormatted} ${cleanedMessage}"
+                            transformedLogs.add(finalLog)
+                        }
+
+                        // Append logs to the file
+                        sh """
+                            echo '${transformedLogs.join("\\n")}' >> ${LOG_FILE_PATH}
+                        """
+                        echo "Logs have been appended to the file: ${LOG_FILE_PATH}"
+
+                    } catch (Exception e) {
+                        echo "Error during log transformation: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+
+        stage('Manage Log File Size') {
+            steps {
+                script {
+                    try {
+                        // Check the log file size
+                        def logFileSize = sh(script: "stat --format=%s ${LOG_FILE_PATH}", returnStdout: true).trim().toLong()
+
+                        echo "Current log file size: ${logFileSize} bytes"
+
+                        if (logFileSize > 5 * 1024 * 1024) {  // If file size exceeds 5MB
+                            def timestamp = new Date().format("yyyy-MM-dd_HH-mm-ss")
+                            def newLogFile = "/home/logai/PiltiSmartLogAI/gui/uploaded_files/custom_thingsboard_${timestamp}.log"
+                            echo "Log file size exceeded 5MB, renaming file to ${newLogFile}"
+
+                            // Rename the log file and create a new one
+                            sh "mv ${LOG_FILE_PATH} ${newLogFile}"
+                            sh "touch ${LOG_FILE_PATH}"
+                            echo "Renamed log file successfully."
+                        }
+                    } catch (Exception e) {
+                        echo "Error managing log files: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+
+        stage('Send Logs to LogAI') {
+            steps {
+                script {
+                    try {
+                        echo "Sending logs securely to LogAI..."
+
+                        // Using sshagent to automatically provide the SSH key from Jenkins credentials
+                        sshagent(credentials: ['logai-ssh']) {
+                            // Use SCP to securely upload the file to the remote server
+                            sh """
+                                scp ${LOG_FILE_PATH} ${SSH_USER}@${LOGAI_VM}:${TARGET_PATH}
+                            """
+                        }
+                        echo "Logs successfully uploaded to LogAI."
+                    } catch (Exception e) {
+                        echo "Error sending logs to LogAI: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+		            echo "Pipeline completed successfully."
+		            handlePostBuildNotification('SUCCESS')
+            }
+        }
+
+        failure {
+            script {
+		              echo "Pipeline failed. Please check the logs for details."
+		              handlePostBuildNotification('FAILURE')
+            }
+        }
+
+        unstable {
+            script {
+                    handlePostBuildNotification('UNSTABLE')
+            }
+        }
+
+        changed {
+            script {
+                    handlePostBuildNotification('CHANGED')
+            }
+        }
+
+        aborted {
+            script {
+                handlePostBuildNotification('ABORTED')
+            } 
+        }
+
+        always {
+            script {
+                echo "Pipeline finished. Check logs for errors."
+            }
+        }
+    }
+}
+
+def handlePostBuildNotification(buildStatus) { 
+    def subject = "Pipeline ${buildStatus}: ${BUILD_NUMBER}"
+    def body = """<html>
+                    <body>
+                    <p>Build Status : ${buildStatus}</p>
+                    <p>Build Number : ${BUILD_NUMBER}</p>
+                    <p>Check the <a href="${BUILD_URL}"> console output</a>.</p>
+                    </body>
+                </html>"""
+                
+    // Send email
+    emailext(subject: subject, body: body, to: "nagalavanya.rn@piltigroup.com", mimeType: 'text/html')
+
+}    
