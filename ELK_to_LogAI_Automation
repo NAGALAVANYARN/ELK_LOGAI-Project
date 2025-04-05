@@ -11,7 +11,7 @@ pipeline {
         TARGET_PATH = '/home/logai/PiltiSmartLogAI/gui/uploaded_files/'
         SSH_KEY_PATH = '/var/jenkins_home/.ssh/id_rsa'
         SSH_USER = 'logai'  // Define SSH user here
-        LOG_FILE_PATH = '/home/logai/PiltiSmartLogAI/gui/uploaded_files/custom_thingsboard1.log'  // Define the log file path here
+        LOG_FILE_PATH = '/home/logai/PiltiSmartLogAI/gui/uploaded_files/custom_thingsboard.log'  // Define the log file path here
     }
 
     stages {
